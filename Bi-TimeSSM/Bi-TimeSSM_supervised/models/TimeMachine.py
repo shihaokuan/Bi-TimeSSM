@@ -21,7 +21,7 @@ class Model(torch.nn.Module):
         if corr is None:
             corr = np.random.rand(10, 10)
 
-        self.ch_ind = self.SRA(corr, threshold)
+        self.ch_ind = 1
 
         if self.ch_ind == 1:
             self.d_model_param1 = 1
@@ -38,18 +38,6 @@ class Model(torch.nn.Module):
                             d_conv=self.configs.dconv, expand=self.configs.e_fact)
         self.mamba4 = Mamba(d_model=self.d_model_param2,d_state=self.configs.d_state,
                             d_conv=self.configs.dconv,expand=self.configs.e_fact)
-        
-        self.encoder = Encoder([
-            EncoderLayer(
-                Mamba(d_model=configs.n1, d_state=configs.d_state, 
-                      d_conv=configs.dconv, expand=configs.e_fact),
-                Mamba(d_model=configs.n1, d_state=configs.d_state, 
-                      d_conv=configs.dconv, expand=configs.e_fact),
-                d_model=configs.n1, d_ff=getattr(configs, "d_ff", 128),
-                dropout=configs.dropout, activation=getattr(configs, "activation", "relu"),
-                residual=configs.residual == 1
-            ) for _ in range(getattr(configs, "e_layers", 4))
-        ], norm_layer=nn.LayerNorm(configs.n1))
 
         self.encoder2 = Encoder([
             EncoderLayer(
@@ -60,26 +48,11 @@ class Model(torch.nn.Module):
                 d_model=configs.n2, d_ff=getattr(configs, "d_ff", 128),
                 dropout=configs.dropout, activation=getattr(configs, "activation", "relu"),
                 residual=configs.residual == 1
-            ) for _ in range(getattr(configs, "e_layers", 1))
+            ) for _ in range(getattr(configs, "e_layers", 4))
         ], norm_layer=nn.LayerNorm(configs.n2))
-
-        self.gddmlp = GDDMLP(n_vars=configs.n1)
-        self.gddmlp2 = GDDMLP(n_vars=configs.n2)
-
+        
         self.lin3 = nn.Linear(self.configs.n2, self.configs.n1)
         self.lin4 = nn.Linear(2 * self.configs.n1, self.configs.pred_len)
-
-    def SRA(self, corr, threshold):
-        high_corr_matrix = corr >= threshold
-        num_high_corr = np.maximum(high_corr_matrix.sum(axis=1) - 1, 0)
-
-        positive_corr_matrix = corr >= 0
-        num_positive_corr = np.maximum(positive_corr_matrix.sum(axis=1) - 1, 0)
-        max_high_corr = num_high_corr.max()
-        max_positive_corr = num_positive_corr.max()
-        r = max_high_corr / max_positive_corr
-        print('SRA -> channel mixing' if r >= 1 - threshold else 'channel independent')
-        return 1 if r >= 1 - threshold else 0
 
     def forward(self, x):
         if self.configs.revin == 1:
@@ -106,9 +79,6 @@ class Model(torch.nn.Module):
         x4=self.mamba4(x4)
         if self.ch_ind==1:
             x4=torch.permute(x4,(0,2,1))
-
-        # x4 =self.gddmlp(x4)
-        # x4 = x4.reshape(-1, 1, x4.shape[-1])
         x4 = x4 + x3
 
         x = self.lin2(x)
@@ -116,8 +86,6 @@ class Model(torch.nn.Module):
         x = self.dropout2(x)
 
         x2 = self.encoder2(x)
-        # x2 = self.gddmlp2(x2)
-        # x2 = x2.reshape(-1, 1, x2.shape[-1])
 
         if self.configs.residual == 1:
             x = x_res2 + x2
@@ -142,45 +110,6 @@ class Model(torch.nn.Module):
             x = x + (means[:, 0, :].unsqueeze(1).repeat(1, self.configs.pred_len, 1))
 
         return x
-
-class GDDMLP(nn.Module):
-    def __init__(self, n_vars, reduction=2, avg_flag=True, max_flag=True):
-        super().__init__()
-        self.avg_flag = avg_flag
-        self.max_flag = max_flag
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.max_pool = nn.AdaptiveMaxPool1d(1)
-
-        self.fc_sc = nn.Sequential(
-            nn.Linear(n_vars, n_vars // reduction, bias=False),
-            nn.GELU(),
-            nn.Linear(n_vars // reduction, n_vars, bias=False)
-        )
-        self.fc_sf = nn.Sequential(
-            nn.Linear(n_vars, n_vars // reduction, bias=False),
-            nn.GELU(),
-            nn.Linear(n_vars // reduction, n_vars, bias=False)
-        )
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        b, n, p = x.shape
-        x = x.view(b * n, p)
-
-        scale = torch.zeros_like(x)
-        shift = torch.zeros_like(x)
-        if self.avg_flag:
-            sc = self.fc_sc(self.avg_pool(x.unsqueeze(-1)).squeeze(-1))
-            sf = self.fc_sf(self.avg_pool(x.unsqueeze(-1)).squeeze(-1))
-            scale += sc
-            shift += sf
-        if self.max_flag:
-            sc = self.fc_sc(self.max_pool(x.unsqueeze(-1)).squeeze(-1))
-            sf = self.fc_sf(self.max_pool(x.unsqueeze(-1)).squeeze(-1))
-            scale += sc
-            shift += sf
-
-        return self.sigmoid(scale) * x + self.sigmoid(shift)
 
 class Add_Norm(nn.Module):
     def __init__(self, d_model, dropout, residual=True):
